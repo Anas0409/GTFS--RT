@@ -1,0 +1,1876 @@
+============================================================
+FICHIER : docker-compose.yml
+============================================================
+version: '3.8'
+
+services:
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:29092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+        kafka-topics --create --topic gtfs.vehicle_positions --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1 --if-not-exists &&
+        kafka-topics --create --topic gtfs.trip_updates --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1 --if-not-exists &&
+        kafka-topics --create --topic gtfs.service_alerts --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1 --if-not-exists
+      "
+    restart: on-failure
+
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: gtfs-cluster
+      CASSANDRA_DC: datacenter1
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+
+  cassandra-init:
+    image: cassandra:4.1
+    container_name: cassandra-init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./cassandra/init.cql:/init.cql
+    command: cqlsh cassandra -f /init.cql
+    restart: on-failure
+
+  producer:
+    build: ./producer
+    container_name: gtfs-producer
+    env_file: .env
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  consumer:
+    build: ./consumer
+    container_name: gtfs-consumer
+    env_file: .env
+    depends_on:
+      kafka:
+        condition: service_healthy
+      cassandra:
+        condition: service_healthy
+      cassandra-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  trino:
+    image: trinodb/trino:435
+    container_name: trino
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./trino/config/config.properties:/etc/trino/config.properties
+      - ./trino/catalog/cassandra.properties:/etc/trino/catalog/cassandra.properties
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  dashboard:
+    build: ./dashboard
+    container_name: gtfs-dashboard
+    ports:
+      - "3001:3000"
+    depends_on:
+      trino:
+        condition: service_healthy
+    restart: unless-stopped
+
+  metabase-db:
+    image: postgres:15
+    container_name: metabase-db
+    environment:
+      POSTGRES_DB: metabase
+      POSTGRES_USER: metabase
+      POSTGRES_PASSWORD: metabase
+    volumes:
+      - metabase_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metabase"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  metabase:
+    image: metabase/metabase:latest
+    container_name: metabase
+    ports:
+      - "3000:3000"
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_PORT: 5432
+      MB_DB_USER: metabase
+      MB_DB_PASS: metabase
+      MB_DB_HOST: metabase-db
+    depends_on:
+      metabase-db:
+        condition: service_healthy
+      trino:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  cassandra_data:
+  metabase_db_data:
+
+networks:
+  default:
+    name: gtfs-network
+
+============================================================
+FICHIER : README.md
+============================================================
+# GTFS-RT Pipeline
+
+[![Python](https://img.shields.io/badge/python-3.11+-blue?logo=python&logoColor=white)](https://python.org)
+[![Docker](https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white)](https://docker.com)
+[![Kafka](https://img.shields.io/badge/kafka-7.6.1-231F20?logo=apachekafka&logoColor=white)](https://kafka.apache.org)
+[![Cassandra](https://img.shields.io/badge/cassandra-4.1-1287B1?logo=apachecassandra&logoColor=white)](https://cassandra.apache.org)
+[![HSL](https://img.shields.io/badge/data-HSL%20Realtime-000000)](https://hsl.fi)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+> Pipeline temps-reel pour ingerer, transporter et stocker les donnees **GTFS-RT** (positions de vehicules, mises a jour de trajets et alertes service) de HSL Helsinki.
+
+---
+
+## Sommaire
+
+- [Architecture](#architecture)
+- [Captures d'ecran](#captures-decrit)
+- [Prerequis](#prerequis)
+- [Installation](#installation)
+- [Acces aux services](#acces-aux-services)
+- [Structure du projet](#structure-du-projet)
+- [Configuration](#configuration)
+- [Utilisation](#utilisation)
+- [Commandes utiles](#commandes-utiles)
+- [Data Flow](#data-flow)
+- [Specifications techniques](#specifications-techniques)
+- [Export du code](#export-du-code)
+
+---
+
+## Architecture
+
+```
+┌─────────────┐    ┌────────────────┐    ┌──────────────────┐    ┌──────────────┐
+│             │    │                │    │                  │    │              │
+│  HSL GTFS   │───▶│   GTFS-RT      │───▶│    Kafka         │───▶│   Cassandra  │
+│  Realtime   │    │   Producer     │    │    (KRaft)       │    │   (4.1)      │
+│  API        │    │                │    │                  │    │              │
+└─────────────┘    └────────────────┘    ├──────────────────┤    └──────────────┘
+                                          │                  │
+                                          │   Kafka UI       │
+                                          │   (localhost:8080)│
+                                          └──────────────────┘
+```
+
+| Composant | Technologie | Role |
+|---|---|---|
+| **Source** | HSL GTFS-RT API | Donnees temps-reel des bus/tram/metro d'Helsinki |
+| **Producer** | Python 3.11 + `gtfs-realtime-bindings` | Telecharge, parse et publie dans Kafka (polling 5s) |
+| **Transport** | Kafka 7.6.1 (KRaft, sans Zookeeper) | File de messages avec 3 topics |
+| **Consumer** | Python 3.11 + `cassandra-driver` | Lit Kafka et ecrit dans Cassandra (batch UNLOGGED) |
+| **Stockage** | Cassandra 4.1 | Base NoSQL columnar |
+| **UI Kafka** | Kafka UI | Monitoring visuel des topics et messages |
+
+---
+
+## Captures d'ecran
+
+### Dashboard temps reel
+
+Carte interactive avec les vehicules en temps reel (fleches orientees selon la direction, colorees par vitesse), statistiques globales et top retards.
+
+![Dashboard - carte des vehicules](image/dashbord0.JPG)
+
+![Dashboard - panneau stats et retards](image/dashbord1.JPG)
+
+### Metabase
+
+Requetage SQL via Trino sur les donnees Cassandra : statistiques trajets, alertes service et top retards.
+
+![Metabase - stats trajets](image/metabase1.jpg)
+
+![Metabase - top retards et alertes](image/metabase2.jpg)
+
+---
+
+## Prerequis
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (v24+)
+- [Docker Compose V2](https://docs.docker.com/compose/) (inclus avec Docker Desktop)
+- Python 3.11+ *(optionnel, pour test local)*
+
+```bash
+docker --version       # Docker 24+
+docker compose version # Docker Compose v2+
+```
+
+---
+
+## Installation
+
+```bash
+# 1. Cloner le depot
+git clone https://github.com/elhamrit-stack/GTFS_RT.git
+cd GTFS_RT
+
+# 2. Lancer toute la stack (Kafka + Cassandra + Producer + Consumer)
+docker compose up -d
+
+# 3. Verifier que tout tourne
+docker compose ps
+
+# 4. Suivre les logs
+docker compose logs -f producer
+docker compose logs -f consumer
+```
+
+---
+
+## Acces aux services
+
+| Service | URL | Description |
+|---|---|---|
+| **Dashboard** | [http://localhost:3001](http://localhost:3001) | Carte interactive temps reel + stats |
+| **Metabase** | [http://localhost:3000](http://localhost:3000) | BI / dashboards SQL (driver Presto) |
+| **Kafka UI** | [http://localhost:8080](http://localhost:8080) | Monitoring visuel des topics Kafka |
+| **Trino** | [http://localhost:8081](http://localhost:8081) (API) | Moteur SQL distribue (catalogue `cassandra`) |
+| **Cassandra** | `localhost:9042` (CQL) | Base NoSQL, interrogeable via `docker exec -it cassandra cqlsh` |
+
+> **Note Metabase** : lors de l'ajout d'une base, choisis le driver **Presto**, renseigne `trino` comme hote, `8080` comme port, `cassandra` comme catalogue et `gtfs` comme schema.
+
+---
+
+## Structure du projet
+
+```
+GTFS_RT/
+├── docker-compose.yml       ← Orchestration complete (6 services)
+├── .env                     ← Configuration (variables d'environnement)
+├── .gitignore
+├── README.md
+├── export_all.py            ← Script pour exporter tous les fichiers
+├── all.txt                  ← Code source consolide (auto-genere)
+│
+├── producer/                ← Ingestion GTFS-RT → Kafka
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── config.py            ← Configuration producer
+│   ├── fetcher.py           ← Download & parsing GTFS-RT (3 endpoints)
+│   ├── producer.py          ← Publication Kafka avec gestion d'erreurs
+│   └── main.py              ← Boucle principale avec graceful shutdown
+│
+├── consumer/                ← Kafka → Cassandra
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── config.py            ← Configuration consumer
+│   ├── cassandra_client.py  ← Connexion Cassandra + batch UNLOGGED
+│   ├── consumer.py          ← Lecture Kafka avec commit manuel
+│   └── main.py              ← Point d'entree avec graceful shutdown
+│
+├── cassandra/
+│   └── init.cql             ← Schema : keyspace + 3 tables
+│
+└── docs/
+    └── topics.md            ← Contrat de donnees
+```
+
+---
+
+## Configuration
+
+Le fichier `.env` contient tous les parametres :
+
+| Variable | Description | Defaut |
+|---|---|---|
+| `KAFKA_BOOTSTRAP_SERVERS` | Adresse du broker Kafka | `kafka:29092` |
+| `TOPIC_VEHICLE_POSITIONS` | Topic positions vehicules | `gtfs.vehicle_positions` |
+| `TOPIC_TRIP_UPDATES` | Topic mises a jour trajets | `gtfs.trip_updates` |
+| `TOPIC_SERVICE_ALERTS` | Topic alertes service | `gtfs.service_alerts` |
+| `GTFS_VEHICLE_URL` | Endpoint HSL vehicle positions | *endpoint HSL* |
+| `GTFS_TRIP_URL` | Endpoint HSL trip updates | *endpoint HSL* |
+| `GTFS_ALERTS_URL` | Endpoint HSL service alerts | *endpoint HSL* |
+| `POLL_INTERVAL_SECONDS` | Intervalle de rafraichissement | `5` |
+| `CASSANDRA_HOST` | Hote Cassandra | `cassandra` |
+| `CASSANDRA_PORT` | Port Cassandra | `9042` |
+| `CASSANDRA_KEYSPACE` | Keyspace Cassandra | `gtfs` |
+
+---
+
+## Utilisation
+
+### 1. Lancer le projet
+
+```bash
+# Lancer tout le projet (premier plan - voir les logs en direct)
+docker compose up
+
+# Lancer + rebuild (quand tu modifies le code)
+docker compose up --build
+```
+
+### 2. Verifier les conteneurs
+
+```bash
+docker ps
+```
+
+Vous devez voir : `producer`, `consumer`, `kafka`, `kafka-ui`, `cassandra`, `cassandra-init` (puis `kafka-init`).
+
+### 3. Logs
+
+```bash
+# Producer (fetch GTFS-RT -> publish Kafka)
+docker logs -f gtfs-producer
+
+# Consumer (consume Kafka -> insert Cassandra)
+docker logs -f gtfs-consumer
+
+# Logs Cassandra
+docker logs -f cassandra
+```
+
+### 4. Tester Kafka
+
+```bash
+# Voir les topics
+docker exec -it kafka kafka-topics --bootstrap-server kafka:29092 --list
+
+# Lire les messages (test consumer)
+docker exec -it kafka kafka-console-consumer \
+  --bootstrap-server kafka:29092 \
+  --topic gtfs.vehicle_positions \
+  --from-beginning
+```
+
+### 5. Interroger Cassandra (CQLSH)
+
+```bash
+# Entrer dans Cassandra
+docker exec -it cassandra cqlsh
+
+-- Choisir la base
+USE gtfs;
+
+-- Voir les tables
+DESCRIBE TABLES;
+
+-- Requete principale
+SELECT * FROM vehicle_positions LIMIT 10;
+
+-- Verifier si donnees existent
+SELECT COUNT(*) FROM vehicle_positions;
+```
+
+---
+
+## Commandes utiles
+
+```bash
+# ─── Docker (lancer / arreter) ───────────────────────────
+
+# Lancer tout le projet
+docker compose up
+
+# Lancer + rebuild (quand tu modifies le code)
+docker compose up --build
+
+# Arreter tout
+docker compose down
+
+# Stop rapide (sans supprimer les conteneurs)
+docker compose stop
+
+# Redemarrer
+docker compose restart
+
+# ─── Verifier les conteneurs ─────────────────────────────
+
+docker ps
+
+# ─── Logs ─────────────────────────────────────────────────
+
+# Producer
+docker logs -f gtfs-producer
+
+# Consumer
+docker logs -f gtfs-consumer
+
+# Cassandra
+docker logs -f cassandra
+
+# ─── Kafka ────────────────────────────────────────────────
+
+# Voir les topics
+docker exec -it kafka kafka-topics --bootstrap-server kafka:29092 --list
+
+# Lire les messages (test consumer)
+docker exec -it kafka kafka-console-consumer \
+  --bootstrap-server kafka:29092 \
+  --topic gtfs.vehicle_positions \
+  --from-beginning
+
+# Voir les offsets du groupe
+docker exec kafka kafka-consumer-groups --bootstrap-server kafka:29092 --group gtfs-cassandra-consumer --describe
+
+# ─── Cassandra ────────────────────────────────────────────
+
+# Entrer dans Cassandra
+docker exec -it cassandra cqlsh
+
+# Choisir la base
+USE gtfs;
+
+# Voir les tables
+DESCRIBE TABLES;
+
+# Requete principale
+SELECT * FROM vehicle_positions LIMIT 10;
+
+# Verifier si donnees existent
+SELECT COUNT(*) FROM vehicle_positions;
+
+# Decrire le keyspace
+docker exec -it cassandra cqlsh -e "DESCRIBE KEYSPACE gtfs;"
+
+# ─── Rebuild ──────────────────────────────────────────────
+
+# Rebuild un service sans cache
+docker compose build --no-cache producer
+docker compose build --no-cache consumer
+
+# Rebuild et relancer
+docker compose up --build
+
+# ─── Maintenance ──────────────────────────────────────────
+
+# Nettoyer les donnees Cassandra (tout supprimer)
+docker compose down -v && docker compose up --build
+
+# Reinitialiser les offsets Kafka
+docker exec kafka kafka-consumer-groups --bootstrap-server kafka:29092 \
+  --group gtfs-cassandra-consumer \
+  --reset-offsets --to-latest --execute --all-topics
+```
+
+---
+
+## Requetes Trino validees pour Metabase
+
+Connecte-toi a Metabase (`http://localhost:3000`) avec le driver **Presto**, hote `trino`, port `8080`, catalogue `cassandra`, schema `gtfs`.
+
+### 1 — Retard moyen global
+
+```sql
+SELECT
+    ROUND(CAST(AVG(avg_delay_seconds) AS double) / 60.0, 2) AS retard_moyen_min
+FROM trip_updates
+```
+
+### 2 — Stats globales (trajets + lignes)
+
+```sql
+SELECT
+    COUNT(*) AS total_trajets,
+    COUNT(DISTINCT route_id) AS lignes_actives
+FROM trip_updates
+```
+
+### 3 — Top 10 retards par ligne
+
+```sql
+SELECT
+    route_id,
+    ROUND(CAST(AVG(avg_delay_seconds) AS double) / 60.0, 1) AS retard_min,
+    COUNT(*) AS nb_trajets
+FROM trip_updates
+WHERE avg_delay_seconds > 0
+GROUP BY route_id
+HAVING COUNT(*) > 3
+ORDER BY retard_min DESC
+LIMIT 10
+```
+
+### 4 — Alertes recentes
+
+```sql
+SELECT
+    ingestion_time,
+    header,
+    description
+FROM service_alerts
+ORDER BY ingestion_time DESC
+LIMIT 20
+```
+
+### 5 — Nombre total d'alertes
+
+```sql
+SELECT COUNT(*) AS total_alerts FROM service_alerts
+```
+
+---
+
+## Data Flow
+
+```
+HSL API                     Kafka Topics                  Cassandra
+─────────                   ─────────────                 ─────────
+                            ┌──────────────────┐
+vehicle-positions ────────▶ │ gtfs.vehicle_    │ ──────▶ vehicle_positions
+                            │ positions        │         (route_id, date,
+                            └──────────────────┘          ingestion_time DESC)
+                            ┌──────────────────┐
+trip-updates ─────────────▶ │ gtfs.trip_       │ ──────▶ trip_updates
+                            │ updates          │         (route_id, date,
+                            └──────────────────┘          ingestion_time DESC)
+                            ┌──────────────────┐
+service-alerts ───────────▶ │ gtfs.service_    │ ──────▶ service_alerts
+                            │ alerts           │         (ingestion_time)
+                            └──────────────────┘
+```
+
+### Topics Kafka
+
+| Topic | Cle | Format | Description |
+|---|---|---|---|
+| `gtfs.vehicle_positions` | `full_vehicle_id` | JSON | Positions GPS des vehicules |
+| `gtfs.trip_updates` | `route_id` | JSON | Retards et mises a jour de trajets |
+| `gtfs.service_alerts` | *aucune* | JSON | Alertes service (travaux, perturbations) |
+
+### Tables Cassandra
+
+| Table | Partition Key | Clustering | Description |
+|---|---|---|---|
+| `vehicle_positions` | `(route_id, start_date)` | `ingestion_time DESC, vehicle_id` | Positions GPS avec operateur et statut lisible |
+| `trip_updates` | `(route_id, start_date)` | `ingestion_time DESC` | Retards moyens par trajet |
+| `service_alerts` | `ingestion_time` | - | Alertes texte avec periode de validite |
+
+---
+
+## Specifications techniques
+
+### Points cles implementes
+
+| Aspect | Implementation |
+|---|---|
+| **Vehicle ID** | `operator_id` + `vehicle_id` extraits du format HSL `<op>/<id>` |
+| **Statut vehicule** | Stocke en texte lisible (`IN_TRANSIT_TO`, `STOPPED_AT`...) au lieu de l'enum entier |
+| **Incertitude** | Champ `max_uncertainty` dans les trip updates (qualite donnee) |
+| **Polling** | 5 secondes (evite rate limiting HSL) |
+| **Batching Cassandra** | `BatchType.UNLOGGED` par lots de 50, buffer max 500 |
+| **Commit Kafka** | Manuel (`enable_auto_commit=False`) apres chaque message |
+| **Backpressure** | Flush force si le buffer depasse `MAX_BUFFER` |
+| **Graceful shutdown** | Handlers `SIGTERM`/`SIGINT` + flush final + close producer/consumer |
+| **Topics** | 3 topics distincts : positions, mises a jour, alertes |
+
+### Ameliorations possibles
+
+- Ajout de Trino pour le requetage SQL interome
+- Metabase ou Apache Superset pour les dashboards
+- Alerting sur les retards anormaux
+- Compression avancee Kafka (ZSTD)
+- Replication Cassandra multi-DC
+
+---
+
+## Export du code
+
+Un script permet de concatener tous les fichiers du projet dans un seul fichier `all.txt` :
+
+```bash
+python export_all.py
+# Genere all.txt avec tous les fichiers listes et leurs contenus
+```
+
+Chaque section est delimitee par `FICHIER : chemin/relatif`.
+
+---
+
+## Licence
+
+Ce projet est sous licence **MIT**. Voir le fichier [LICENSE](LICENSE) pour plus de details.
+
+---
+
+<p align="center">
+  <sub>Construit dans le cadre du module Big Data — ETGI/S8</sub>
+</p>
+
+
+============================================================
+FICHIER : test.py
+============================================================
+import time
+import requests
+from google.transit import gtfs_realtime_pb2
+
+URL = "https://realtime.hsl.fi/realtime/vehicle-positions/v2/hsl"
+
+def fetch():
+    try:
+        r = requests.get(URL, timeout=10)
+        r.raise_for_status()
+
+        feed = gtfs_realtime_pb2.FeedMessage()
+        feed.ParseFromString(r.content)
+
+        vehicles = 0
+        for entity in feed.entity:
+            if entity.HasField("vehicle"):
+                vehicles += 1
+
+        return len(r.content), vehicles
+
+    except Exception as e:
+        return 0, f"error: {e}"
+
+
+def main():
+    start = time.time()
+
+    while time.time() - start < 20:
+        size, vehicles = fetch()
+        print(f"Feed size: {size} bytes | Vehicles: {vehicles}")
+        time.sleep(1)
+
+    print("\nScan finished.")
+
+
+if __name__ == "__main__":
+    main()
+
+============================================================
+FICHIER : test.txt
+============================================================
+
+
+============================================================
+FICHIER : vp.bin
+============================================================
+[impossible de lire vp.bin]
+
+
+============================================================
+FICHIER : vp1.bin
+============================================================
+[impossible de lire vp1.bin]
+
+
+============================================================
+FICHIER : cassandra\init.cql
+============================================================
+-- Keyspace
+CREATE KEYSPACE IF NOT EXISTS gtfs
+WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+
+USE gtfs;
+
+-- Table : positions des véhicules
+-- Partition par route_id + jour → requêtes par ligne / période
+-- trip_id volontairement absent (non fiable selon doc HSL)
+CREATE TABLE IF NOT EXISTS vehicle_positions (
+    route_id        text,
+    start_date      text,
+    ingestion_time  bigint,
+    operator_id     text,
+    vehicle_id      text,
+    full_vehicle_id text,
+    direction_id    int,
+    start_time      text,
+    latitude        double,
+    longitude       double,
+    bearing         float,
+    speed           float,
+    current_status  text,
+    gtfs_timestamp  bigint,
+    PRIMARY KEY ((route_id, start_date), ingestion_time, vehicle_id)
+) WITH CLUSTERING ORDER BY (ingestion_time DESC);
+
+-- Table : retards par trajet
+CREATE TABLE IF NOT EXISTS trip_updates (
+    route_id            text,
+    start_date          text,
+    ingestion_time      bigint,
+    start_time          text,
+    direction_id        int,
+    avg_delay_seconds   double,
+    num_stops           int,
+    gtfs_timestamp      bigint,
+    PRIMARY KEY ((route_id, start_date), ingestion_time)
+) WITH CLUSTERING ORDER BY (ingestion_time DESC);
+
+-- Table : alertes service
+CREATE TABLE IF NOT EXISTS service_alerts (
+    ingestion_time bigint,
+    header text,
+    description text,
+    start_time bigint,
+    end_time bigint,
+    PRIMARY KEY (ingestion_time)
+);
+
+
+============================================================
+FICHIER : consumer\cassandra_client.py
+============================================================
+"""
+Connexion à Cassandra et insertion des donnees.
+1 message = 1 insert (pas de batch).
+"""
+import logging
+import time
+from cassandra.cluster import Cluster
+from cassandra.policies import ExponentialReconnectionPolicy
+import config
+
+logger = logging.getLogger(__name__)
+
+INSERT_VEHICLE = """
+INSERT INTO vehicle_positions (
+    operator_id, vehicle_id, full_vehicle_id,
+    route_id, direction_id, start_date, start_time,
+    latitude, longitude, bearing, speed, current_status,
+    gtfs_timestamp, ingestion_time
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+INSERT_TRIP = """
+INSERT INTO trip_updates (
+    route_id, start_date, start_time, direction_id,
+    avg_delay_seconds, num_stops,
+    gtfs_timestamp, ingestion_time
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+INSERT_ALERT = """
+INSERT INTO service_alerts (
+    ingestion_time, header, description, start_time, end_time
+) VALUES (?, ?, ?, ?, ?)
+"""
+
+
+class CassandraClient:
+    def __init__(self):
+        self.session  = None
+        self.stmt_vp  = None
+        self.stmt_tu  = None
+        self.stmt_sa  = None
+        self._connect()
+
+    def _connect(self, retries: int = 20):
+        for attempt in range(1, retries + 1):
+            try:
+                cluster = Cluster(
+                    [config.CASSANDRA_HOST],
+                    port=config.CASSANDRA_PORT,
+                    reconnection_policy=ExponentialReconnectionPolicy(1, 60),
+                )
+                self.session = cluster.connect(config.CASSANDRA_KEYSPACE)
+                self.stmt_vp = self.session.prepare(INSERT_VEHICLE)
+                self.stmt_tu = self.session.prepare(INSERT_TRIP)
+                self.stmt_sa = self.session.prepare(INSERT_ALERT)
+                logger.info(f"Cassandra connected ({config.CASSANDRA_HOST})")
+                return
+            except Exception as e:
+                logger.warning(f"Cassandra not ready ({attempt}/{retries}): {e}")
+                time.sleep(5)
+        raise RuntimeError("Cannot connect to Cassandra")
+
+    def insert_vehicle_position(self, msg: dict):
+        self.session.execute(self.stmt_vp, (
+            msg["operator_id"],
+            msg["vehicle_id"],
+            msg["full_vehicle_id"],
+            msg["route_id"],
+            msg["direction_id"],
+            msg["start_date"],
+            msg["start_time"],
+            msg["latitude"],
+            msg["longitude"],
+            msg["bearing"],
+            msg["speed"],
+            msg["current_status"],
+            msg["gtfs_timestamp"],
+            msg["ingestion_time"],
+        ))
+
+    def insert_trip_update(self, msg: dict):
+        self.session.execute(self.stmt_tu, (
+            msg["route_id"],
+            msg["start_date"],
+            msg["start_time"],
+            msg["direction_id"],
+            msg["avg_delay_seconds"],
+            msg["num_stops"],
+            msg["gtfs_timestamp"],
+            msg["ingestion_time"],
+        ))
+
+    def insert_service_alert(self, msg: dict):
+        self.session.execute(self.stmt_sa, (
+            msg["ingestion_time"],
+            msg["header"],
+            msg["description"],
+            msg["start_time"],
+            msg["end_time"],
+        ))
+
+
+============================================================
+FICHIER : consumer\config.py
+============================================================
+import os
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+TOPIC_VEHICLE_POSITIONS  = os.getenv("TOPIC_VEHICLE_POSITIONS", "gtfs.vehicle_positions")
+TOPIC_TRIP_UPDATES       = os.getenv("TOPIC_TRIP_UPDATES",      "gtfs.trip_updates")
+TOPIC_SERVICE_ALERTS     = os.getenv("TOPIC_SERVICE_ALERTS",    "gtfs.service_alerts")
+KAFKA_GROUP_ID           = "gtfs-cassandra-consumer"
+
+CASSANDRA_HOST     = os.getenv("CASSANDRA_HOST",     "localhost")
+CASSANDRA_PORT     = int(os.getenv("CASSANDRA_PORT", "9042"))
+CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "gtfs")
+
+
+============================================================
+FICHIER : consumer\consumer.py
+============================================================
+"""
+Lit les messages Kafka et les persiste dans Cassandra.
+"""
+import json
+import logging
+import time
+from kafka import KafkaConsumer
+from kafka.errors import NoBrokersAvailable
+import config
+from cassandra_client import CassandraClient
+
+logger = logging.getLogger(__name__)
+
+
+def create_consumer(retries: int = 15) -> KafkaConsumer:
+    for attempt in range(1, retries + 1):
+        try:
+            c = KafkaConsumer(
+                config.TOPIC_VEHICLE_POSITIONS,
+                config.TOPIC_TRIP_UPDATES,
+                config.TOPIC_SERVICE_ALERTS,
+                bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
+                group_id=config.KAFKA_GROUP_ID,
+                auto_offset_reset="earliest",
+                enable_auto_commit=False,
+                value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+            )
+            logger.info("✅ Kafka consumer ready")
+            return c
+        except NoBrokersAvailable:
+            logger.warning(f"⏳ Kafka not ready ({attempt}/{retries}), waiting 5s...")
+            time.sleep(5)
+    raise RuntimeError("❌ Cannot connect to Kafka")
+
+
+def run(consumer: KafkaConsumer, db: CassandraClient, is_running=None):
+    logger.info("Listening to Kafka topics...")
+    counts = {config.TOPIC_VEHICLE_POSITIONS: 0, config.TOPIC_TRIP_UPDATES: 0, config.TOPIC_SERVICE_ALERTS: 0}
+
+    while True:
+        records = consumer.poll(timeout_ms=1000)
+        if not records:
+            if is_running and not is_running():
+                break
+            continue
+
+        for topic_partition, messages in records.items():
+            for record in messages:
+                topic = record.topic
+                msg   = record.value
+
+                try:
+                    if topic == config.TOPIC_VEHICLE_POSITIONS:
+                        db.insert_vehicle_position(msg)
+                    elif topic == config.TOPIC_TRIP_UPDATES:
+                        db.insert_trip_update(msg)
+                    elif topic == config.TOPIC_SERVICE_ALERTS:
+                        db.insert_service_alert(msg)
+
+                    consumer.commit()
+                    counts[topic] += 1
+
+                    if sum(counts.values()) % 500 == 0:
+                        logger.info(f"  Inserted: VP={counts[config.TOPIC_VEHICLE_POSITIONS]} | TU={counts[config.TOPIC_TRIP_UPDATES]} | SA={counts[config.TOPIC_SERVICE_ALERTS]}")
+
+                except Exception as e:
+                    logger.error(f"Error processing [{topic}]: {e} | msg={msg}")
+
+
+============================================================
+FICHIER : consumer\Dockerfile
+============================================================
+FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y gcc && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "main.py"]
+
+
+============================================================
+FICHIER : consumer\main.py
+============================================================
+import logging
+import signal
+from consumer import create_consumer, run
+from cassandra_client import CassandraClient
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [CONSUMER] %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+running = True
+
+
+def shutdown(signum, frame):
+    global running
+    logger.info("Shutdown signal received, exiting...")
+    running = False
+
+
+def main():
+    global running
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    db       = CassandraClient()
+    consumer = create_consumer()
+    try:
+        run(consumer, db, lambda: running)
+    finally:
+        consumer.close()
+        logger.info("Consumer stopped.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+============================================================
+FICHIER : consumer\requirements.txt
+============================================================
+kafka-python==2.0.2
+cassandra-driver==3.29.1
+
+
+============================================================
+FICHIER : dashboard\Dockerfile
+============================================================
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3000", "--log-level", "info"]
+
+============================================================
+FICHIER : dashboard\main.py
+============================================================
+"""
+Backend FastAPI — expose les données GTFS via REST et WebSocket.
+Interroge Trino, qui lit Cassandra via son connecteur officiel.
+"""
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.templating import Jinja2Templates
+from fastapi.requests import Request
+import trino
+import asyncio
+from datetime import date
+
+app = FastAPI(title="GTFS-RT Dashboard")
+templates = Jinja2Templates(directory="templates")
+
+
+def get_trino_cursor():
+    conn = trino.dbapi.connect(
+        host="trino",
+        port=8080,
+        user="dashboard",
+        catalog="cassandra",
+        schema="gtfs",
+    )
+    return conn.cursor()
+
+
+def query(sql: str) -> list[dict]:
+    cur = get_trino_cursor()
+    cur.execute(sql)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def today() -> str:
+    return date.today().strftime("%Y%m%d")
+
+
+# ── Vehicle Positions ─────────────────────────────────────────────────────────
+
+def fetch_live_positions() -> list[dict]:
+    """Derniere position GPS de chaque vehicule (60 dernieres secondes)."""
+    return query("""
+        WITH ranked AS (
+            SELECT
+                vehicle_id, route_id,
+                latitude, longitude,
+                ROUND(CAST(speed AS double) * 3.6, 1) AS vitesse_kmh,
+                bearing, current_status,
+                ROW_NUMBER() OVER (
+                    PARTITION BY vehicle_id
+                    ORDER BY ingestion_time DESC
+                ) AS rn
+            FROM vehicle_positions
+            WHERE ingestion_time > (to_unixtime(now()) - 60)
+        )
+        SELECT vehicle_id, route_id, latitude, longitude,
+               vitesse_kmh, bearing, current_status
+        FROM ranked
+        WHERE rn = 1
+          AND latitude  BETWEEN 59.9 AND 60.5
+          AND longitude BETWEEN 24.5 AND 25.5
+    """)
+
+
+def fetch_vehicle_stats() -> dict:
+    """Stats vehicules (compte, vitesse moyenne)."""
+    rows = query("""
+        SELECT
+            COUNT(DISTINCT vehicle_id) AS vehicules_actifs,
+            ROUND(CAST(AVG(speed) AS double) * 3.6, 1) AS vitesse_moy_kmh
+        FROM vehicle_positions
+        WHERE ingestion_time > (to_unixtime(now()) - 60)
+    """)
+    return rows[0] if rows else {"vehicules_actifs": 0, "vitesse_moy_kmh": 0.0}
+
+
+# ── Trip Updates ──────────────────────────────────────────────────────────────
+
+def fetch_top_delays() -> list[dict]:
+    """Top 10 lignes les plus en retard — scan complet, filtré côté Trino."""
+    return query("""
+        SELECT
+            route_id,
+            ROUND(CAST(AVG(avg_delay_seconds) AS double) / 60.0, 1) AS retard_min,
+            COUNT(*) AS nb_trajets
+        FROM trip_updates
+        WHERE avg_delay_seconds > 0
+        GROUP BY route_id
+        HAVING COUNT(*) > 3
+        ORDER BY retard_min DESC
+        LIMIT 10
+    """)
+
+
+def fetch_global_stats_updates() -> dict:
+    """Statistiques globales sur les trip updates."""
+    rows = query("""
+        SELECT
+            COUNT(*)  AS total_trajets,
+            COUNT(DISTINCT route_id) AS lignes_actives,
+            ROUND(CAST(AVG(avg_delay_seconds) AS double) / 60.0, 2) AS retard_moyen_min
+        FROM trip_updates
+    """)
+    return rows[0] if rows else {"total_trajets": 0, "lignes_actives": 0, "retard_moyen_min": 0.0}
+
+
+# ── Service Alerts ────────────────────────────────────────────────────────────
+
+def fetch_recent_alerts() -> list[dict]:
+    """20 dernières alertes."""
+    return query("""
+        SELECT
+            ingestion_time,
+            header,
+            description,
+            start_time,
+            end_time
+        FROM service_alerts
+        ORDER BY ingestion_time DESC
+        LIMIT 20
+    """)
+
+
+def fetch_alert_count() -> dict:
+    """Nombre total d'alertes."""
+    rows = query("SELECT COUNT(*) AS total_alerts FROM service_alerts")
+    return rows[0] if rows else {"total_alerts": 0}
+
+
+# ── Routes HTTP ───────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/api/delays")
+def api_delays():
+    return fetch_top_delays()
+
+@app.get("/api/positions")
+def api_positions():
+    return fetch_live_positions()
+
+@app.get("/api/stats")
+def api_stats():
+    vp = fetch_vehicle_stats()
+    tu = fetch_global_stats_updates()
+    alerts = fetch_alert_count()
+    return {**vp, **tu, **alerts}
+
+@app.get("/api/alerts")
+def api_alerts():
+    return fetch_recent_alerts()
+
+@app.get("/api/trajectory/{vehicle_id}")
+def api_trajectory(vehicle_id: str):
+    """Trajet complet d'un vehicule aujourd'hui."""
+    return query(f"""
+        SELECT latitude, longitude, ingestion_time, speed,
+               bearing, current_status
+        FROM vehicle_positions
+        WHERE vehicle_id = '{vehicle_id}'
+          AND start_date = '{today()}'
+        ORDER BY ingestion_time ASC
+    """)
+
+
+# ── WebSocket ─────────────────────────────────────────────────────────────────
+
+@app.websocket("/ws/dashboard")
+async def ws_dashboard(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            await ws.send_json({
+                "positions": fetch_live_positions(),
+                "delays":    fetch_top_delays(),
+                "stats":     {**fetch_vehicle_stats(), **fetch_global_stats_updates()},
+                "alerts":    fetch_recent_alerts()[:5],
+            })
+            await asyncio.sleep(5)
+    except WebSocketDisconnect:
+        pass
+
+
+============================================================
+FICHIER : dashboard\requirements.txt
+============================================================
+fastapi==0.111.0
+uvicorn==0.29.0
+trino==0.328.0
+jinja2==3.1.4
+websockets==12.0
+
+============================================================
+FICHIER : dashboard\templates\index.html
+============================================================
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GTFS-RT · Helsinki Live</title>
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; display: flex;
+           height: 100vh; background: #111; color: #e0e0e0; }
+
+    /* Carte principale */
+    #map { flex: 1; }
+
+    /* Panneau latéral */
+    #panel {
+      width: 300px; background: #1a1a2e; display: flex;
+      flex-direction: column; overflow: hidden;
+    }
+    #panel-header {
+      padding: 16px; border-bottom: 1px solid #2a2a4a;
+    }
+    #panel-header h1 { font-size: 15px; font-weight: 600;
+                       color: #e0e0ff; letter-spacing: 0.5px; }
+    #panel-header p  { font-size: 12px; color: #6060a0; margin-top: 2px; }
+
+    /* Métriques */
+    .metrics { display: grid; grid-template-columns: 1fr 1fr 1fr;
+               gap: 8px; padding: 12px; }
+    .metric { background: #12122a; border-radius: 8px;
+              padding: 10px 8px; text-align: center; }
+    .metric-val { font-size: 20px; font-weight: 600; color: #a0c4ff; }
+    .metric-lbl { font-size: 10px; color: #5050a0; margin-top: 2px;
+                  text-transform: uppercase; letter-spacing: 0.5px; }
+
+    /* Liste retards */
+    #delays-title { font-size: 11px; color: #5050a0; text-transform: uppercase;
+                    letter-spacing: 0.5px; padding: 0 12px 6px; }
+    #delays-list  { flex: 1; overflow-y: auto; padding: 0 12px 12px; }
+    .delay-row    { display: flex; align-items: center; justify-content: space-between;
+                    padding: 7px 10px; margin-bottom: 4px; border-radius: 6px;
+                    background: #12122a; font-size: 12px; }
+    .delay-route  { font-weight: 600; color: #c0c0ff; }
+    .delay-val    { color: #ff9966; font-weight: 500; }
+
+    /* Statut connexion */
+    #status { padding: 8px 12px; font-size: 11px; color: #404060;
+              border-top: 1px solid #2a2a4a; display: flex;
+              align-items: center; gap: 6px; }
+    #status-dot { width: 6px; height: 6px; border-radius: 50%;
+                  background: #44ff88; transition: background .3s; }
+    #status-dot.off { background: #ff4444; }
+  </style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="panel">
+  <div id="panel-header">
+    <h1>GTFS-RT · Helsinki</h1>
+    <p>Temps réel · actualisation 15s</p>
+  </div>
+
+  <div class="metrics">
+    <div class="metric">
+      <div class="metric-val" id="m-vehicles">—</div>
+      <div class="metric-lbl">Véhicules</div>
+    </div>
+    <div class="metric">
+      <div class="metric-val" id="m-lines">—</div>
+      <div class="metric-lbl">Lignes</div>
+    </div>
+    <div class="metric">
+      <div class="metric-val" id="m-speed">—</div>
+      <div class="metric-lbl">km/h moy.</div>
+    </div>
+  </div>
+
+  <div id="delays-title">Lignes les plus en retard</div>
+  <div id="delays-list">Chargement...</div>
+
+  <div id="status">
+    <div id="status-dot"></div>
+    <span id="status-text">Connexion en cours...</span>
+  </div>
+</div>
+
+<script>
+// ─── Carte Leaflet ────────────────────────────────────────────────────────────
+
+const map = L.map('map', { zoomControl: false }).setView([60.17, 24.94], 12);
+
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '© OpenStreetMap © CARTO',
+  maxZoom: 18,
+}).addTo(map);
+
+L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+// ─── Marqueurs dynamiques (flèches orientées) ────────────────────────────────
+
+const markers = {};
+let trajectoryLine = null;
+let selectedVehicle = null;
+
+function speedColor(kmh) {
+  if (kmh < 5)  return '#ff4444';
+  if (kmh < 25) return '#ffaa33';
+  if (kmh < 50) return '#44aaff';
+  return '#44ff88';
+}
+
+function arrowIcon(bearing, color) {
+  return L.divIcon({
+    className: '',
+    html: `<div style="
+      width:0;height:0;
+      border-left:6px solid transparent;
+      border-right:6px solid transparent;
+      border-bottom:12px solid ${color};
+      transform:rotate(${bearing}deg);
+      filter:drop-shadow(0 0 2px rgba(0,0,0,.6));
+    "></div>`,
+    iconSize: [12, 12],
+    iconAnchor: [6, 8],
+  });
+}
+
+function onVehicleClick(vehicleId) {
+  if (selectedVehicle === vehicleId) {
+    map.removeLayer(trajectoryLine);
+    trajectoryLine = null;
+    selectedVehicle = null;
+    return;
+  }
+  if (trajectoryLine) {
+    map.removeLayer(trajectoryLine);
+    trajectoryLine = null;
+  }
+  selectedVehicle = vehicleId;
+
+  fetch(`/api/trajectory/${vehicleId}`)
+    .then(r => r.json())
+    .then(points => {
+      if (!points.length) return;
+      const latlngs = points.map(p => [p.latitude, p.longitude]);
+      trajectoryLine = L.polyline(latlngs, {
+        color: '#ffaa44',
+        weight: 3,
+        opacity: 0.7,
+      }).addTo(map);
+      map.fitBounds(trajectoryLine.getBounds().pad(0.05));
+    });
+}
+
+function updateMarkers(positions) {
+  const seen = new Set();
+
+  positions.forEach(v => {
+    seen.add(v.vehicle_id);
+    const lat = v.latitude;
+    const lng = v.longitude;
+    const bearing = v.bearing || 0;
+    const color = speedColor(v.vitesse_kmh || 0);
+
+    if (markers[v.vehicle_id]) {
+      markers[v.vehicle_id].setLatLng([lat, lng]);
+      markers[v.vehicle_id].setIcon(arrowIcon(bearing, color));
+    } else {
+      const marker = L.marker([lat, lng], {
+        icon: arrowIcon(bearing, color),
+        zIndexOffset: 1000,
+      }).addTo(map);
+
+      marker.bindPopup(`
+        <b>Ligne ${v.route_id}</b><br>
+        Véhicule : ${v.vehicle_id}<br>
+        Vitesse : ${v.vitesse_kmh} km/h<br>
+        Statut : ${v.current_status}
+      `);
+
+      marker.on('click', () => onVehicleClick(v.vehicle_id));
+      markers[v.vehicle_id] = marker;
+    }
+  });
+
+  Object.keys(markers).forEach(id => {
+    if (!seen.has(id)) {
+      map.removeLayer(markers[id]);
+      delete markers[id];
+    }
+  });
+}
+
+// ─── Métriques et retards ─────────────────────────────────────────────────────
+
+function updateStats(stats) {
+  document.getElementById('m-vehicles').textContent =
+    stats.vehicules_actifs ?? '—';
+  document.getElementById('m-lines').textContent =
+    stats.lignes_actives ?? '—';
+  document.getElementById('m-speed').textContent =
+    stats.vitesse_moy_kmh ?? '—';
+}
+
+function renderDelays(data) {
+  const list = document.getElementById('delays-list');
+  if (!data.length) { list.textContent = 'Aucun retard.'; return; }
+  list.innerHTML = data.map(d => `
+    <div class="delay-row">
+      <span class="delay-route">Ligne ${d.route_id}</span>
+      <span class="delay-val">+${d.retard_min} min</span>
+    </div>
+  `).join('');
+}
+
+// ─── WebSocket ────────────────────────────────────────────────────────────────
+
+const dot  = document.getElementById('status-dot');
+const text = document.getElementById('status-text');
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws/dashboard`);
+
+  ws.onopen = () => {
+    dot.classList.remove('off');
+    text.textContent = 'Connecté · actualisation 15s';
+  };
+
+  ws.onmessage = (e) => {
+    const payload = JSON.parse(e.data);
+    updateMarkers(payload.positions || []);
+    updateStats(payload.stats || {});
+    renderDelays(payload.delays || []);
+  };
+
+  ws.onclose = () => {
+    dot.classList.add('off');
+    text.textContent = 'Reconnexion dans 5s...';
+    setTimeout(connect, 5000);    // reconnexion automatique
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+// ─── Initial fill (avant WS) ──────────────────────────────────────────────────
+
+(async () => {
+  try {
+    const [stats, delays] = await Promise.all([
+      fetch('/api/stats').then(r => r.json()),
+      fetch('/api/delays').then(r => r.json()),
+    ]);
+    updateStats(stats);
+    renderDelays(delays);
+  } catch (e) { /* WS prendra le relais */ }
+})();
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
+connect();
+</script>
+</body>
+</html>
+
+============================================================
+FICHIER : docs\topics.md
+============================================================
+# topics.md
+
+
+============================================================
+FICHIER : image\dashbord0.JPG
+============================================================
+[impossible de lire image\dashbord0.JPG]
+
+
+============================================================
+FICHIER : image\dashbord1.JPG
+============================================================
+[impossible de lire image\dashbord1.JPG]
+
+
+============================================================
+FICHIER : image\metabase1.jpg
+============================================================
+[impossible de lire image\metabase1.jpg]
+
+
+============================================================
+FICHIER : image\metabase2.jpg
+============================================================
+[impossible de lire image\metabase2.jpg]
+
+
+============================================================
+FICHIER : producer\config.py
+============================================================
+import os
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+
+TOPIC_VEHICLE_POSITIONS = os.getenv("TOPIC_VEHICLE_POSITIONS", "gtfs.vehicle_positions")
+TOPIC_TRIP_UPDATES      = os.getenv("TOPIC_TRIP_UPDATES",      "gtfs.trip_updates")
+TOPIC_SERVICE_ALERTS    = os.getenv("TOPIC_SERVICE_ALERTS",    "gtfs.service_alerts")
+
+GTFS_VEHICLE_URL = os.getenv(
+    "GTFS_VEHICLE_URL",
+    "https://realtime.hsl.fi/realtime/vehicle-positions/v2/hsl"
+)
+GTFS_TRIP_URL = os.getenv(
+    "GTFS_TRIP_URL",
+    "https://realtime.hsl.fi/realtime/trip-updates/v2/hsl"
+)
+GTFS_ALERTS_URL = os.getenv(
+    "GTFS_ALERTS_URL",
+    "https://realtime.hsl.fi/realtime/service-alerts/v2/hsl"
+)
+
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "5"))
+USER_AGENT = "GTFS-Pipeline/1.0"
+
+
+============================================================
+FICHIER : producer\Dockerfile
+============================================================
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "main.py"]
+
+
+============================================================
+FICHIER : producer\fetcher.py
+============================================================
+"""
+Télécharge et parse les flux GTFS-RT HSL.
+Retourne des dicts Python prêts à sérialiser en JSON.
+"""
+import time
+import logging
+import requests
+from google.transit import gtfs_realtime_pb2
+import config
+
+logger = logging.getLogger(__name__)
+
+
+def _download(url: str) -> bytes | None:
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": config.USER_AGENT},
+            timeout=30
+        )
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        logger.error(f"Download failed [{url}]: {e}")
+        return None
+
+
+def fetch_vehicle_positions() -> list[dict]:
+    raw = _download(config.GTFS_VEHICLE_URL)
+    if not raw:
+        return []
+
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(raw)
+
+    now = int(time.time())
+    results = []
+
+    STATUS_MAP = {
+        0: "INCOMING_AT",
+        1: "STOPPED_AT",
+        2: "IN_TRANSIT_TO",
+    }
+
+    if not feed.entity:
+        logger.info("  vehicle_positions : feed empty (no active vehicles)")
+        return []
+
+    for entity in feed.entity:
+        v = entity.vehicle
+        if not v.vehicle.id:
+            continue
+
+        full_id = v.vehicle.id
+        parts = full_id.split("/", 1)
+        operator_id = parts[0] if len(parts) > 1 else ""
+        vehicle_id  = parts[1] if len(parts) > 1 else parts[0]
+
+        results.append({
+            "operator_id":     operator_id,
+            "vehicle_id":      vehicle_id,
+            "full_vehicle_id": full_id,
+            "route_id":        v.trip.route_id if v.HasField("trip") else "",
+            "direction_id":    v.trip.direction_id if v.HasField("trip") else 0,
+            "start_date":      v.trip.start_date   if v.HasField("trip") else "",
+            "start_time":      v.trip.start_time   if v.HasField("trip") else "",
+            "latitude":        v.position.latitude,
+            "longitude":       v.position.longitude,
+            "bearing":         v.position.bearing,
+            "speed":           v.position.speed,
+            "current_status":  STATUS_MAP.get(v.current_status, "UNKNOWN"),
+            "gtfs_timestamp":  v.timestamp,
+            "ingestion_time":  now,
+        })
+
+    return results
+
+
+def fetch_trip_updates() -> list[dict]:
+    raw = _download(config.GTFS_TRIP_URL)
+    if not raw:
+        return []
+
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(raw)
+
+    now = int(time.time())
+    results = []
+
+    for entity in feed.entity:
+        if not entity.HasField("trip_update"):
+            continue
+        tu   = entity.trip_update
+        trip = tu.trip
+
+        delays = []
+        uncertainties = []
+        for stu in tu.stop_time_update:
+            if stu.HasField("arrival"):
+                delays.append(stu.arrival.delay)
+                if stu.arrival.uncertainty:
+                    uncertainties.append(stu.arrival.uncertainty)
+            if stu.HasField("departure"):
+                delays.append(stu.departure.delay)
+                if stu.departure.uncertainty:
+                    uncertainties.append(stu.departure.uncertainty)
+
+        results.append({
+            "route_id":            trip.route_id      if trip.route_id    else "",
+            "start_date":          trip.start_date    if trip.start_date  else "",
+            "start_time":          trip.start_time    if trip.start_time  else "",
+            "direction_id":        trip.direction_id,
+            "avg_delay_seconds":   sum(delays) / len(delays) if delays else 0.0,
+            "max_uncertainty":     max(uncertainties) if uncertainties else 0,
+            "num_stops":           len(tu.stop_time_update),
+            "gtfs_timestamp":      now,
+            "ingestion_time":      now,
+        })
+
+    return results
+
+
+def fetch_service_alerts() -> list[dict]:
+    raw = _download(config.GTFS_ALERTS_URL)
+    if not raw:
+        return []
+
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(raw)
+
+    now = int(time.time())
+    results = []
+
+    for entity in feed.entity:
+        if not entity.HasField("alert"):
+            continue
+
+        a = entity.alert
+
+        results.append({
+            "header": a.header_text.translation[0].text if a.header_text.translation else "",
+            "description": a.description_text.translation[0].text if a.description_text.translation else "",
+            "start_time": a.active_period[0].start if a.active_period else None,
+            "end_time": a.active_period[0].end if a.active_period else None,
+            "ingestion_time": now
+        })
+
+    return results
+
+
+============================================================
+FICHIER : producer\main.py
+============================================================
+"""
+Boucle principale : fetch → parse → publish → sleep.
+"""
+import logging
+import signal
+import time
+import config
+from fetcher import fetch_vehicle_positions, fetch_trip_updates, fetch_service_alerts
+from producer import create_producer, publish
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [PRODUCER] %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+running = True
+
+
+def shutdown(signum, frame):
+    global running
+    logger.info("Shutdown signal received, exiting...")
+    running = False
+
+
+def main():
+    global running
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    logger.info("GTFS Producer starting...")
+    producer = create_producer()
+
+    iteration = 0
+    while running:
+        iteration += 1
+        logger.info(f"-- Iteration #{iteration} ---------------------")
+
+        vp = fetch_vehicle_positions()
+        if vp:
+            n = publish(producer, config.TOPIC_VEHICLE_POSITIONS, vp, "full_vehicle_id")
+            logger.info(f"  vehicle_positions : {n}/{len(vp)} sent")
+        else:
+            logger.info("  vehicle_positions : 0/0 sent")
+
+        tu = fetch_trip_updates()
+        if tu:
+            n = publish(producer, config.TOPIC_TRIP_UPDATES, tu, "route_id")
+            logger.info(f"  trip_updates      : {n}/{len(tu)} sent")
+
+        sa = fetch_service_alerts()
+        if sa:
+            n = publish(producer, config.TOPIC_SERVICE_ALERTS, sa, None)
+            logger.info(f"  service_alerts    : {n}/{len(sa)} sent")
+
+        if running:
+            logger.info(f"  sleeping {config.POLL_INTERVAL_SECONDS}s...")
+            time.sleep(config.POLL_INTERVAL_SECONDS)
+
+    producer.close()
+    logger.info("Producer stopped.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+============================================================
+FICHIER : producer\producer.py
+============================================================
+"""
+Publie les messages dans les topics Kafka.
+"""
+import json
+import logging
+import time
+from kafka import KafkaProducer
+from kafka.errors import NoBrokersAvailable
+import config
+
+logger = logging.getLogger(__name__)
+
+
+def create_producer(retries: int = 15) -> KafkaProducer:
+    for attempt in range(1, retries + 1):
+        try:
+            p = KafkaProducer(
+                bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                key_serializer=lambda k: str(k).encode("utf-8") if k else None,
+                acks="all",
+                retries=3,
+                compression_type="gzip",
+            )
+            logger.info(f"✅ Kafka connected: {config.KAFKA_BOOTSTRAP_SERVERS}")
+            return p
+        except NoBrokersAvailable:
+            logger.warning(f"⏳ Kafka not ready ({attempt}/{retries}), waiting 5s...")
+            time.sleep(5)
+    raise RuntimeError("❌ Cannot connect to Kafka after retries")
+
+
+def publish(producer: KafkaProducer, topic: str, messages: list[dict], key_field: str | None = None) -> int:
+    sent = 0
+    for msg in messages:
+        key = msg.get(key_field) if key_field else None
+        try:
+            producer.send(topic, key=key, value=msg).get(timeout=10)
+            sent += 1
+        except Exception as e:
+            logger.error(f"Send error on {topic}: {e}")
+    return sent
+
+
+============================================================
+FICHIER : producer\requirements.txt
+============================================================
+gtfs-realtime-bindings==1.0.0
+kafka-python==2.0.2
+requests==2.31.0
+protobuf==4.25.3
+
+
+============================================================
+FICHIER : trino\catalog\cassandra.properties
+============================================================
+connector.name=cassandra
+cassandra.contact-points=cassandra
+cassandra.native-protocol-port=9042
+cassandra.load-policy.dc-aware.local-dc=datacenter1
+cassandra.allow-drop-table=true
+cassandra.speculative-execution.limit=1
+
+============================================================
+FICHIER : trino\config\config.properties
+============================================================
+coordinator=true
+node-scheduler.include-coordinator=true
+http-server.http.port=8080
+discovery.uri=http://trino:8080
+
