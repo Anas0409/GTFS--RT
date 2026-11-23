@@ -91,16 +91,19 @@ docker compose version # Docker Compose v2+
 
 ```bash
 # 1. Cloner le depot
-git clone https://github.com/elhamrit-stack/GTFS_RT.git
-cd GTFS_RT
+git clone https://github.com/Anas0409/GTFS--RT.git
+cd GTFS--RT
 
-# 2. Lancer toute la stack (Kafka + Cassandra + Producer + Consumer)
+# 2. Creer le fichier de configuration
+cp .env.example .env
+
+# 3. Lancer toute la stack (Kafka + Cassandra + Producer + Consumer)
 docker compose up -d
 
-# 3. Verifier que tout tourne
+# 4. Verifier que tout tourne
 docker compose ps
 
-# 4. Suivre les logs
+# 5. Suivre les logs
 docker compose logs -f producer
 docker compose logs -f consumer
 ```
@@ -126,7 +129,7 @@ docker compose logs -f consumer
 ```
 GTFS_RT/
 ├── docker-compose.yml       ← Orchestration complete (6 services)
-├── .env                     ← Configuration (variables d'environnement)
+├── .env.example             ← Modele de configuration (copier en .env)
 ├── .gitignore
 ├── README.md
 ├── export_all.py            ← Script pour exporter tous les fichiers
@@ -159,7 +162,7 @@ GTFS_RT/
 
 ## Configuration
 
-Le fichier `.env` contient tous les parametres :
+Le fichier `.env` (cree a partir de `.env.example`) contient tous les parametres :
 
 | Variable | Description | Defaut |
 |---|---|---|
